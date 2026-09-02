@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Hidden Geometry Removal",
     "author": "Seungwoo Lee",
-    "version": (0, 2, 1),
+    "version": (0, 2, 2),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > Hidden Removal",
     "description": "Removes geometry that is not visible from multiple camera positions.",
@@ -45,7 +45,25 @@ def get_or_create_camera_collection(context):
     return coll
 
 
-def create_camera_ring(row_angle, height_angles, radius, center, collection, prefix="HGR_Cam"):
+FOV_MARGIN = 1.2
+
+
+def required_fov(bounding_radius, distance):
+    """Field of view wide enough for the whole object to fall inside the cone.
+
+    Visibility is tested against a cone (angle from the camera axis), so the
+    camera's FOV has to cover the object's bounding sphere. Blender's default
+    50mm lens is only ~39.6 degrees, which clipped the corners off anything but
+    small objects and made exposed faces look hidden.
+    """
+    if distance <= bounding_radius:
+        return math.radians(179.0)
+    fov = 2.0 * math.asin(bounding_radius / distance) * FOV_MARGIN
+    return min(fov, math.radians(179.0))
+
+
+def create_camera_ring(row_angle, height_angles, radius, center, collection,
+                       fov, prefix="HGR_Cam"):
     cameras = []
     row_rad = math.radians(row_angle)
 
@@ -59,6 +77,8 @@ def create_camera_ring(row_angle, height_angles, radius, center, collection, pre
 
         name = f"{prefix}.Row{row_angle:.0f}.{i + 1}"
         cam_data = bpy.data.cameras.new(name=name)
+        cam_data.type = 'PERSP'
+        cam_data.angle = fov
         cam_obj = bpy.data.objects.new(name, cam_data)
         cam_obj[CAM_TAG] = True
 
@@ -74,7 +94,8 @@ def create_camera_ring(row_angle, height_angles, radius, center, collection, pre
     return cameras
 
 
-def create_camera_setup(context, rows, cameras_per_row, sphere_radius, center, keep_cameras):
+def create_camera_setup(context, rows, cameras_per_row, sphere_radius, center,
+                        keep_cameras, bounding_radius):
     collection = get_or_create_camera_collection(context) if keep_cameras else context.scene.collection
 
     row_angle_step = 360.0 / rows
@@ -86,10 +107,13 @@ def create_camera_setup(context, rows, cameras_per_row, sphere_radius, center, k
         angle = height_angle_step * (i + 1)
         height_angles.extend([angle, -angle])
 
+    fov = required_fov(bounding_radius, sphere_radius)
+
     all_cameras = []
     for i in range(rows):
         all_cameras.extend(
-            create_camera_ring(i * row_angle_step, height_angles, sphere_radius, center, collection)
+            create_camera_ring(i * row_angle_step, height_angles, sphere_radius,
+                               center, collection, fov)
         )
 
     # Make sure matrix_world is up to date before we read it
@@ -556,13 +580,21 @@ class OBJECT_OT_hidden_geometry_removal(Operator):
 
         delete_generated_cameras(context)
 
-        center = obj.matrix_world @ (
-            sum((Vector(c) for c in obj.bound_box), Vector()) / 8.0
-        )
+        corners = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+        center = sum(corners, Vector()) / 8.0
+        bounding_radius = max((c - center).length for c in corners)
+
         if props.auto_distance:
             radius = max(obj.dimensions) * 2.0 + 1.0
         else:
             radius = props.sphere_radius
+
+        if radius <= bounding_radius:
+            self.report(
+                {'WARNING'},
+                "Camera distance is inside the object's bounding sphere; "
+                "results will be unreliable"
+            )
 
         cameras = create_camera_setup(
             context,
@@ -571,6 +603,7 @@ class OBJECT_OT_hidden_geometry_removal(Operator):
             radius,
             center,
             props.keep_cameras,
+            bounding_radius,
         )
 
         transparent = [o for o in transparent if o is not obj]
