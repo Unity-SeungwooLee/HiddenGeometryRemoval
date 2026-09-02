@@ -1,8 +1,8 @@
-# Hidden Geometry Removal (Compatible with Blender 4.0+)
+# Hidden Geometry Removal (Compatible with Blender 4.2+)
 ### A Blender Add-on for Optimizing 3D Models
 
-![Blender Version](https://img.shields.io/badge/Blender-4.0%2B-orange)
-![Version](https://img.shields.io/badge/Version-0.1.3-blue)
+![Blender Version](https://img.shields.io/badge/Blender-4.2%2B-orange)
+![Version](https://img.shields.io/badge/Version-0.2.0-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ## Overview
@@ -27,7 +27,7 @@ Hidden Geometry Removal is a powerful Blender add-on that automatically identifi
 
 1. Download the latest release (`HiddenGeometryRemoval.py`)
 2. Open Blender and go to `Edit > Preferences > Add-ons`
-3. Click `Install` and select the downloaded file
+3. Click `Install from Disk` and select the downloaded file
 4. Enable the add-on by checking the box
 
 ## Usage
@@ -39,7 +39,8 @@ Hidden Geometry Removal is a powerful Blender add-on that automatically identifi
    - **Merge by Distance**: Option to merge vertices that are close to each other
    - **Number of Rows**: Controls the number of vertical camera splines around the object
    - **Cameras per Row**: Sets how many cameras are placed along each spline
-   - **Camera Distance**: Adjusts how far cameras are from the object's center
+   - **Auto Distance**: Enabled by default. Derives the camera distance from the object's bounding box, so cameras always sit outside the mesh regardless of its scale
+   - **Camera Distance**: Only used when Auto Distance is off. Sets how far cameras are placed from the object's center
    - **Delete/Select Mode**: Choose between removing hidden geometry or selecting visible faces
    - **Precision**: Toggle between high and low precision analysis
    - **Keep Cameras**: Option to retain cameras in a 'Cameras' collection for visualization
@@ -72,7 +73,11 @@ For proper internal geometry removal, the add-on first merges all selected meshe
   - Minimum: 2
   - Maximum: 12
   - Default: 4
-  - Must be even number
+  - Odd values are rounded down
+ 
+- **Auto Distance**: When enabled, the camera radius is computed from the object's largest dimension with margin added. This is the recommended setting and handles both tiny props and large architectural models
+
+- **Camera Distance**: Manual radius, greyed out unless Auto Distance is off. Useful when the object's bounding box is much larger than the geometry you actually care about — for example a long, thin mesh rotated at an angle, where the axis-aligned bounding box overestimates the size and pushes cameras further away than necessary
 
 ### Processing Options
 - **High Precision**: Checks vertices and edge midpoints (slower but more accurate)
@@ -92,7 +97,7 @@ For proper internal geometry removal, the add-on first merges all selected meshe
 ## Best Practices
 
 1. **Always Enable Mesh Merging**: To properly remove internal geometry, keep the "Merge Meshes" option enabled
-2. **Camera Distance**: Set it larger than your object's maximum dimension
+2. **Camera Distance**: Leave Auto Distance enabled unless you have a reason not to. If you turn it off, set the distance larger than your object's maximum dimension, or the cameras will end up inside the mesh
 3. **Number of Cameras**: Start with default values and increase if needed
 4. **Precision Mode**: Use 'High' for final processing, 'Low' for testing
 5. **Backup**: Always save your file before processing large models
