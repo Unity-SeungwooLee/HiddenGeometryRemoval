@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Hidden Geometry Removal",
     "author": "Seungwoo Lee",
-    "version": (0, 2, 0),
+    "version": (0, 2, 1),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > Hidden Removal",
     "description": "Removes geometry that is not visible from multiple camera positions.",
@@ -14,8 +14,12 @@ import bpy
 import bmesh
 import math
 import random
+import os
+import contextlib
 
+from concurrent.futures import ThreadPoolExecutor
 from mathutils import Vector
+from mathutils.bvhtree import BVHTree
 from bpy.props import IntProperty, FloatProperty, EnumProperty, BoolProperty
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy.utils import register_class, unregister_class
@@ -108,13 +112,77 @@ def delete_generated_cameras(context):
 # Mesh helpers
 # ---------------------------------------------------------------------------
 
-def merge_meshes(context, scope):
+def material_is_transparent(mat):
+    """A material counts as transparent if anything about it lets you see through."""
+    if mat is None:
+        return False
+
+    if not mat.use_nodes or mat.node_tree is None:
+        return mat.diffuse_color[3] < 1.0
+
+    # Blender 4.2+ renamed blend_method to surface_render_method (EEVEE Next)
+    render_method = getattr(mat, "surface_render_method", None)
+    if render_method is not None:
+        if render_method == 'BLENDED':
+            return True
+    else:
+        blend_method = getattr(mat, "blend_method", None)
+        if blend_method is not None and blend_method != 'OPAQUE':
+            return True
+
+    for node in mat.node_tree.nodes:
+        if node.type in {'BSDF_GLASS', 'BSDF_TRANSPARENT', 'BSDF_REFRACTION'}:
+            return True
+
+        if node.type == 'BSDF_PRINCIPLED':
+            alpha = node.inputs.get("Alpha")
+            if alpha is not None:
+                # A linked alpha is treated as transparent: we cannot evaluate the
+                # texture here, and under-deleting is safer than over-deleting.
+                if alpha.is_linked or alpha.default_value < 1.0:
+                    return True
+
+            # "Transmission" was renamed to "Transmission Weight" in 4.x
+            for name in ("Transmission Weight", "Transmission"):
+                socket = node.inputs.get(name)
+                if socket is None:
+                    continue
+                if socket.is_linked or socket.default_value > 0.0:
+                    return True
+                break
+
+    return mat.diffuse_color[3] < 1.0
+
+
+def object_is_transparent(obj, cache):
+    for slot in obj.material_slots:
+        mat = slot.material
+        if mat is None:
+            continue
+        key = mat.name_full
+        if key not in cache:
+            cache[key] = material_is_transparent(mat)
+        if cache[key]:
+            return True
+    return False
+
+
+def collect_transparent_objects(context):
+    cache = {}
+    return [
+        o for o in context.scene.objects
+        if o.type == 'MESH' and o.visible_get() and object_is_transparent(o, cache)
+    ]
+
+
+def merge_meshes(context, scope, exclude=()):
     if scope == 'SELECTED':
         mesh_objects = [o for o in context.selected_objects if o.type == 'MESH']
     else:
         mesh_objects = [o for o in context.scene.objects if o.type == 'MESH']
 
-    mesh_objects = [o for o in mesh_objects if o.visible_get()]
+    excluded = set(exclude)
+    mesh_objects = [o for o in mesh_objects if o.visible_get() and o not in excluded]
     if not mesh_objects:
         return None
 
@@ -129,6 +197,67 @@ def merge_meshes(context, scope):
     return context.view_layer.objects.active
 
 
+def build_scene_bvh(context, exclude=()):
+    """Build one BVH from every visible mesh, in world space.
+
+    Using all meshes (not just the target) keeps occlusion behaving the same as
+    scene.ray_cast, so this stays correct whether or not Merge Meshes is on.
+    """
+    depsgraph = context.evaluated_depsgraph_get()
+    excluded = set(exclude)
+
+    verts = []
+    polys = []
+
+    for obj in context.scene.objects:
+        if obj.type != 'MESH' or obj in excluded or not obj.visible_get():
+            continue
+
+        eval_obj = obj.evaluated_get(depsgraph)
+        try:
+            mesh = eval_obj.to_mesh()
+        except RuntimeError:
+            continue
+        if mesh is None:
+            continue
+
+        try:
+            matrix = eval_obj.matrix_world
+            offset = len(verts)
+            verts.extend(matrix @ v.co for v in mesh.vertices)
+            for poly in mesh.polygons:
+                polys.append(tuple(i + offset for i in poly.vertices))
+        finally:
+            eval_obj.to_mesh_clear()
+
+    if not polys:
+        return None
+
+    return BVHTree.FromPolygons(verts, polys, all_triangles=False)
+
+
+@contextlib.contextmanager
+def temporarily_hidden(context, objects):
+    """Pull objects out of the depsgraph so scene.ray_cast cannot hit them.
+
+    hide_viewport removes an object from depsgraph evaluation entirely, which is
+    what makes transparent geometry stop blocking rays. Restored on exit, even if
+    the pass raises.
+    """
+    previous = [(obj, obj.hide_viewport) for obj in objects]
+    try:
+        for obj, _ in previous:
+            obj.hide_viewport = True
+        if previous:
+            context.view_layer.update()
+        yield
+    finally:
+        for obj, state in previous:
+            obj.hide_viewport = state
+        if previous:
+            context.view_layer.update()
+
+
 def are_faces_similar(face1, face2, max_angle_diff):
     try:
         angle = abs(face1.normal.angle(face2.normal))
@@ -137,11 +266,69 @@ def are_faces_similar(face1, face2, max_angle_diff):
     return math.degrees(angle) <= max_angle_diff
 
 
+def camera_setup_data(cameras):
+    """Flatten camera transforms into plain mathutils data usable off-thread."""
+    data = []
+    for cam in cameras:
+        matrix = cam.matrix_world
+        data.append((
+            matrix.translation.copy(),
+            (matrix.to_quaternion() @ Vector((0.0, 0.0, -1.0))).normalized(),
+            (cam.data.angle if cam.data.type == 'PERSP' else math.radians(90.0)) / 2.0,
+        ))
+    return data
+
+
+def face_sample_points(face, matrix, precision):
+    points = [matrix @ face.calc_center_median()]
+    if precision == 'HIGH':
+        points.extend(matrix @ v.co for v in face.verts)
+        points.extend(
+            (matrix @ e.verts[0].co + matrix @ e.verts[1].co) / 2.0
+            for e in face.edges
+        )
+    return points
+
+
+def point_is_visible(points, cam_data, cast):
+    """True if any sample point is directly reachable from any camera."""
+    for cam_location, cam_direction, half_fov in cam_data:
+        for point in points:
+            delta = point - cam_location
+            if delta.length_squared == 0.0:
+                continue
+            to_point = delta.normalized()
+            if to_point.angle(cam_direction) >= half_fov:
+                continue
+            hit_loc = cast(cam_location, to_point)
+            if hit_loc is not None and (hit_loc - point).length < 1e-3:
+                return True
+    return False
+
+
+def make_caster(scene, depsgraph, bvh):
+    if bvh is not None:
+        def cast(origin, direction):
+            return bvh.ray_cast(origin, direction)[0]
+    else:
+        def cast(origin, direction):
+            result = scene.ray_cast(depsgraph=depsgraph, origin=origin, direction=direction)
+            return result[1] if result[0] else None
+    return cast
+
+
+def resolve_thread_count(requested, job_size):
+    if requested <= 0:
+        requested = os.cpu_count() or 1
+    return max(1, min(requested, job_size))
+
+
 def select_visible_faces(context, obj, cameras, precision, experimental,
-                         sampling_ratio, flatness_angle):
+                         sampling_ratio, flatness_angle, bvh=None, thread_count=0):
     scene = context.scene
     depsgraph = context.evaluated_depsgraph_get()
-    mw = obj.matrix_world
+    matrix = obj.matrix_world
+    cam_data = camera_setup_data(cameras)
 
     mesh = obj.data
     bm = bmesh.new()
@@ -157,60 +344,53 @@ def select_visible_faces(context, obj, cameras, precision, experimental,
             return 0, 0
 
         if experimental:
+            # Flood fill depends on selection state as it goes, so it stays serial.
+            cast = make_caster(scene, depsgraph, bvh)
             sample_count = max(1, int(total_faces * (sampling_ratio / 100.0)))
-            initial_faces = random.sample(list(bm.faces), sample_count)
-        else:
-            initial_faces = list(bm.faces)
-
-        for camera in cameras:
-            cam_matrix = camera.matrix_world
-            cam_location = cam_matrix.translation
-            cam_direction = cam_matrix.to_quaternion() @ Vector((0.0, 0.0, -1.0))
-            cam_fov = camera.data.angle if camera.data.type == 'PERSP' else math.radians(90.0)
-            half_fov = cam_fov / 2.0
-
-            faces_to_check = set(initial_faces)
-            checked_faces = set()
+            faces_to_check = set(random.sample(list(bm.faces), sample_count))
+            checked = set()
 
             while faces_to_check:
-                current_face = faces_to_check.pop()
-                if current_face in checked_faces or current_face.select:
+                face = faces_to_check.pop()
+                if face in checked or face.select:
                     continue
-                checked_faces.add(current_face)
+                checked.add(face)
 
-                points = [mw @ current_face.calc_center_median()]
-                if precision == 'HIGH':
-                    points.extend(mw @ v.co for v in current_face.verts)
-                    points.extend(
-                        (mw @ e.verts[0].co + mw @ e.verts[1].co) / 2.0
-                        for e in current_face.edges
-                    )
+                if point_is_visible(face_sample_points(face, matrix, precision), cam_data, cast):
+                    face.select = True
+                    for vert in face.verts:
+                        for linked in vert.link_faces:
+                            if (linked not in checked and not linked.select
+                                    and are_faces_similar(face, linked, flatness_angle)):
+                                faces_to_check.add(linked)
+        else:
+            # Sample points are extracted up front so worker threads never touch
+            # BMesh or any Blender data - they only see mathutils Vectors.
+            all_points = [face_sample_points(f, matrix, precision) for f in bm.faces]
 
-                for point in points:
-                    delta = point - cam_location
-                    if delta.length_squared == 0.0:
-                        continue
-                    to_point = delta.normalized()
+            workers = resolve_thread_count(thread_count, total_faces) if bvh is not None else 1
 
-                    if to_point.angle(cam_direction) >= half_fov:
-                        continue
+            if workers > 1:
+                def scan(bounds):
+                    start, end = bounds
+                    local_cast = make_caster(scene, depsgraph, bvh)
+                    return [
+                        i for i in range(start, end)
+                        if point_is_visible(all_points[i], cam_data, local_cast)
+                    ]
 
-                    hit, hit_loc, _normal, _index, _hit_obj, _matrix = scene.ray_cast(
-                        depsgraph=depsgraph,
-                        origin=cam_location,
-                        direction=to_point,
-                    )
-                    if hit and (hit_loc - point).length < 1e-3:
-                        current_face.select = True
+                step = math.ceil(total_faces / workers)
+                chunks = [(s, min(s + step, total_faces)) for s in range(0, total_faces, step)]
 
-                        if experimental:
-                            for vert in current_face.verts:
-                                for linked_face in vert.link_faces:
-                                    if (linked_face not in checked_faces
-                                            and not linked_face.select
-                                            and are_faces_similar(current_face, linked_face, flatness_angle)):
-                                        faces_to_check.add(linked_face)
-                        break
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    for visible_indices in pool.map(scan, chunks):
+                        for i in visible_indices:
+                            bm.faces[i].select = True
+            else:
+                cast = make_caster(scene, depsgraph, bvh)
+                for i, points in enumerate(all_points):
+                    if point_is_visible(points, cam_data, cast):
+                        bm.faces[i].select = True
 
         # Propagate the face selection DOWN to their verts/edges. select_flush(True)
         # flushes the other way (verts/edges -> faces), which left the mesh looking
@@ -227,6 +407,7 @@ def select_visible_faces(context, obj, cameras, precision, experimental,
         return total_faces, sum(1 for f in bm.faces if f.select)
     finally:
         bm.free()
+
 
 
 def delete_invisible_faces():
@@ -311,6 +492,27 @@ class HiddenRemovalProperties(PropertyGroup):
         ],
         default='ALL',
     )
+    use_bvh: BoolProperty(
+        name="Fast Ray Casting",
+        description=(
+            "Build a BVH of the visible meshes once and reuse it, instead of querying "
+            "the scene for every ray. Much faster, and required for multithreading"
+        ),
+        default=True,
+    )
+    thread_count: IntProperty(
+        name="Threads",
+        description="Number of worker threads. 0 uses every available core",
+        default=0, min=0, max=64,
+    )
+    ignore_transparent: BoolProperty(
+        name="Ignore Transparent",
+        description=(
+            "Treat meshes with a transparent material as see-through: they are left "
+            "untouched and stop blocking visibility, so geometry behind glass is kept"
+        ),
+        default=True,
+    )
     merge_by_distance: BoolProperty(
         name="Merge by Distance",
         description="Merge vertices that are very close to each other",
@@ -338,8 +540,10 @@ class OBJECT_OT_hidden_geometry_removal(Operator):
         if context.object and context.object.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
+        transparent = collect_transparent_objects(context) if props.ignore_transparent else []
+
         if props.merge_meshes:
-            obj = merge_meshes(context, props.merge_scope)
+            obj = merge_meshes(context, props.merge_scope, exclude=transparent)
         else:
             obj = context.active_object
 
@@ -369,14 +573,21 @@ class OBJECT_OT_hidden_geometry_removal(Operator):
             props.keep_cameras,
         )
 
+        transparent = [o for o in transparent if o is not obj]
+
         try:
-            total_faces, visible_count = select_visible_faces(
-                context, obj, cameras,
-                props.precision_mode,
-                props.experimental,
-                props.sampling_ratio,
-                props.flatness_angle,
-            )
+            with temporarily_hidden(context, transparent):
+                bvh = build_scene_bvh(context, exclude=transparent) if props.use_bvh else None
+
+                total_faces, visible_count = select_visible_faces(
+                    context, obj, cameras,
+                    props.precision_mode,
+                    props.experimental,
+                    props.sampling_ratio,
+                    props.flatness_angle,
+                    bvh=bvh,
+                    thread_count=props.thread_count,
+                )
         finally:
             if not props.keep_cameras:
                 delete_generated_cameras(context)
@@ -384,6 +595,8 @@ class OBJECT_OT_hidden_geometry_removal(Operator):
         if total_faces == 0:
             self.report({'WARNING'}, "Mesh has no faces")
             return {'CANCELLED'}
+
+        skipped = f", {len(transparent)} transparent skipped" if transparent else ""
 
         if props.delete_select_mode == 'DELETE':
             delete_invisible_faces()
@@ -399,7 +612,7 @@ class OBJECT_OT_hidden_geometry_removal(Operator):
             self.report(
                 {'INFO'},
                 f"{visible_faces}/{total_faces} faces kept "
-                f"({removal_percent:.1f}% removed) using {len(cameras)} cameras"
+                f"({removal_percent:.1f}% removed) using {len(cameras)} cameras{skipped}"
             )
         else:
             # Outer Select: leave the user in Edit Mode with the surviving faces
@@ -411,7 +624,7 @@ class OBJECT_OT_hidden_geometry_removal(Operator):
             self.report(
                 {'INFO'},
                 f"{visible_count}/{total_faces} faces selected as visible "
-                f"({hidden} hidden) using {len(cameras)} cameras"
+                f"({hidden} hidden) using {len(cameras)} cameras{skipped}"
             )
 
         return {'FINISHED'}
@@ -439,6 +652,7 @@ class VIEW3D_PT_hidden_geometry_removal(Panel):
         sub.enabled = props.merge_meshes
         sub.prop(props, "merge_scope")
         col.prop(props, "merge_by_distance")
+        col.prop(props, "ignore_transparent")
 
         layout.separator()
 
@@ -464,6 +678,16 @@ class VIEW3D_PT_hidden_geometry_removal(Panel):
         if props.experimental:
             col.prop(props, "sampling_ratio")
             col.prop(props, "flatness_angle")
+
+        layout.separator()
+
+        col = layout.column(align=True)
+        col.prop(props, "use_bvh")
+        sub = col.column(align=True)
+        sub.enabled = props.use_bvh and not props.experimental
+        sub.prop(props, "thread_count")
+        if props.use_bvh and props.experimental:
+            col.label(text="Experimental mode runs single threaded", icon='INFO')
 
         layout.separator()
 
